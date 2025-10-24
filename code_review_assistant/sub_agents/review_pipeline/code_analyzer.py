@@ -1,87 +1,44 @@
-def _extract_code_structure(tree: ast.AST, code: str) -> Dict[str, Any]:
-    """
-    Helper function to extract structural information from AST.
-    Runs in thread pool for CPU-bound work.
-    """
-    functions = []
-    classes = []
-    imports = []
-    docstrings = []
+"""
+Code Analyzer Agent - Understands code structure and complexity.
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            func_info = {
-                'name': node.name,
-                'args': [arg.arg for arg in node.args.args],
-                'lineno': node.lineno,
-                'has_docstring': ast.get_docstring(node) is not None,
-                'is_async': isinstance(node, ast.AsyncFunctionDef),
-                'decorators': [d.id for d in node.decorator_list
-                               if isinstance(d, ast.Name)]
-            }
-            functions.append(func_info)
+This agent is responsible for parsing and analyzing Python code structure,
+identifying functions, classes, imports, and potential issues.
+"""
 
-            if func_info['has_docstring']:
-                docstrings.append(f"{node.name}: {ast.get_docstring(node)[:50]}...")
-
-        elif isinstance(node, ast.ClassDef):
-            methods = []
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef):
-                    methods.append(item.name)
-
-            class_info = {
-                'name': node.name,
-                'lineno': node.lineno,
-                'methods': methods,
-                'has_docstring': ast.get_docstring(node) is not None,
-                'base_classes': [base.id for base in node.bases
-                                 if isinstance(base, ast.Name)]
-            }
-            classes.append(class_info)
-
-        elif isinstance(node, ast.Import):
-            for alias in node.names:
-                imports.append({
-                    'module': alias.name,
-                    'alias': alias.asname,
-                    'type': 'import'
-                })
-        elif isinstance(node, ast.ImportFrom):
-            imports.append({
-                'module': node.module or '',
-                'names': [alias.name for alias in node.names],
-                'type': 'from_import',
-                'level': node.level
-            })
-
-    return {
-        'functions': functions,
-        'classes': classes,
-        'imports': imports,
-        'docstrings': docstrings,
-        'metrics': {
-            'line_count': len(code.splitlines()),
-            'function_count': len(functions),
-            'class_count': len(classes),
-            'import_count': len(imports),
-            'has_main': any(f['name'] == 'main' for f in functions),
-            'has_if_main': '__main__' in code,
-            'avg_function_length': _calculate_avg_function_length(tree)
-        }
-    }
+from google.adk.agents import Agent
+from google.adk.tools import FunctionTool
+from code_review_assistant.config import config
+from code_review_assistant.tools import analyze_code_structure
 
 
-def _calculate_avg_function_length(tree: ast.AST) -> float:
-    """Calculate average function length in lines."""
-    function_lengths = []
+code_analyzer_agent = Agent(
+    name="CodeAnalyzer",
+    model=config.worker_model,
+    description="Analyzes Python code structure and identifies components",
+    instruction="""You are a code analysis specialist responsible for understanding code structure.
 
-    for node in ast.walk(tree):
-        if isinstance(node, ast.FunctionDef):
-            if hasattr(node, 'end_lineno') and hasattr(node, 'lineno'):
-                length = node.end_lineno - node.lineno + 1
-                function_lengths.append(length)
+Your task:
+1. Take the code submitted by the user (it will be provided in the user message)
+2. Use the analyze_code_structure tool to parse and analyze it
+3. Pass the EXACT code to your tool - do not modify, fix, or "improve" it
+4. Identify all functions, classes, imports, and structural patterns
+5. Note any syntax errors or structural issues
+6. Store the analysis in state for other agents to use
 
-    if function_lengths:
-        return sum(function_lengths) / len(function_lengths)
-    return 0.0
+CRITICAL:
+- Pass the code EXACTLY as provided to the analyze_code_structure tool
+- Do not fix syntax errors, even if obvious
+- Do not add missing imports or fix indentation
+- The goal is to analyze what IS there, not what SHOULD be there
+
+When calling the tool, pass the code as a string to the 'code' parameter.
+If the analysis fails due to syntax errors, clearly report the error location and type.
+
+Provide a clear summary including:
+- Number of functions and classes found
+- Key structural observations
+- Any syntax errors or issues detected
+- Overall code organization assessment""",
+    tools=[FunctionTool(func=analyze_code_structure)],
+    output_key="structure_analysis_summary"
+)
