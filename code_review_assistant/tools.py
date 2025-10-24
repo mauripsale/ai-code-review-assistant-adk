@@ -367,13 +367,310 @@ def _calculate_style_score(issues: List[Dict[str, Any]]) -> int:
     return max(0, 100 - min(total_deduction, 100))
 
 
-# MODULE_5_STEP_4_SEARCH_PAST_FEEDBACK
+async def search_past_feedback(developer_id: str, tool_context: ToolContext) -> Dict[str, Any]:
+    """
+    Search for past feedback in memory service.
+
+    Args:
+        developer_id: ID of the developer (defaults to "default_user")
+        tool_context: ADK tool context with potential memory service access
+
+    Returns:
+        Dictionary containing feedback search results
+    """
+    logger.info(f"Tool: Searching for past feedback for developer {developer_id}...")
+
+    try:
+        # Default developer ID if not provided
+        if not developer_id:
+            developer_id = tool_context.state.get(StateKeys.USER_ID, 'default_user')
+
+        # Check if memory service is available
+        if hasattr(tool_context, 'search_memory'):
+            try:
+                # Perform structured searches
+                queries = [
+                    f"developer:{developer_id} code review feedback",
+                    f"developer:{developer_id} common issues",
+                    f"developer:{developer_id} improvements"
+                ]
+
+                all_feedback = []
+                patterns = {
+                    'common_issues': [],
+                    'improvements': [],
+                    'strengths': []
+                }
+
+                for query in queries:
+                    search_result = await tool_context.search_memory(query)
+
+                    if search_result and hasattr(search_result, 'memories'):
+                        for memory in search_result.memories[:5]:
+                            memory_text = memory.text if hasattr(memory, 'text') else str(memory)
+                            all_feedback.append(memory_text)
+
+                            # Extract patterns
+                            if 'style' in memory_text.lower():
+                                patterns['common_issues'].append('style compliance')
+                            if 'improved' in memory_text.lower():
+                                patterns['improvements'].append('showing improvement')
+                            if 'excellent' in memory_text.lower():
+                                patterns['strengths'].append('consistent quality')
+
+                # Store in state
+                tool_context.state[StateKeys.PAST_FEEDBACK] = all_feedback
+                tool_context.state[StateKeys.FEEDBACK_PATTERNS] = patterns
+
+                logger.info(f"Tool: Found {len(all_feedback)} past feedback items")
+
+                return {
+                    "status": "success",
+                    "feedback_found": True,
+                    "count": len(all_feedback),
+                    "summary": " | ".join(all_feedback[:3]) if all_feedback else "No feedback",
+                    "patterns": patterns
+                }
+
+            except Exception as e:
+                logger.warning(f"Tool: Memory search error: {e}")
+
+        # Fallback: Check state for cached feedback
+        cached_feedback = tool_context.state.get(StateKeys.USER_PAST_FEEDBACK_CACHE, [])
+        if cached_feedback:
+            tool_context.state[StateKeys.PAST_FEEDBACK] = cached_feedback
+            return {
+                "status": "success",
+                "feedback_found": True,
+                "count": len(cached_feedback),
+                "summary": "Using cached feedback",
+                "patterns": {}
+            }
+
+        # No feedback found
+        tool_context.state[StateKeys.PAST_FEEDBACK] = []
+        logger.info("Tool: No past feedback found")
+
+        return {
+            "status": "success",
+            "feedback_found": False,
+            "message": "No past feedback available - this appears to be a first submission",
+            "patterns": {}
+        }
+
+    except Exception as e:
+        error_msg = f"Feedback search error: {str(e)}"
+        logger.error(f"Tool: {error_msg}", exc_info=True)
+
+        tool_context.state[StateKeys.PAST_FEEDBACK] = []
+
+        return {
+            "status": "error",
+            "message": error_msg,
+            "feedback_found": False
+        }
 
 
-# MODULE_5_STEP_4_UPDATE_GRADING_PROGRESS
+async def update_grading_progress(tool_context: ToolContext) -> Dict[str, Any]:
+    """
+    Updates grading progress counters and metrics in state.
+    """
+    logger.info("Tool: Updating grading progress...")
+
+    try:
+        current_time = datetime.now().isoformat()
+
+        # Build all state changes
+        state_updates = {}
+
+        # Temporary (invocation-level) state
+        state_updates[StateKeys.TEMP_PROCESSING_TIMESTAMP] = current_time
+
+        # Session-level state
+        attempts = tool_context.state.get(StateKeys.GRADING_ATTEMPTS, 0) + 1
+        state_updates[StateKeys.GRADING_ATTEMPTS] = attempts
+        state_updates[StateKeys.LAST_GRADING_TIME] = current_time
+
+        # User-level persistent state
+        lifetime_submissions = tool_context.state.get(StateKeys.USER_TOTAL_SUBMISSIONS, 0) + 1
+        state_updates[StateKeys.USER_TOTAL_SUBMISSIONS] = lifetime_submissions
+        state_updates[StateKeys.USER_LAST_SUBMISSION_TIME] = current_time
+
+        # Calculate improvement metrics
+        current_style_score = tool_context.state.get(StateKeys.STYLE_SCORE, 0)
+        last_style_score = tool_context.state.get(StateKeys.USER_LAST_STYLE_SCORE, 0)
+        score_improvement = current_style_score - last_style_score
+
+        state_updates[StateKeys.USER_LAST_STYLE_SCORE] = current_style_score
+        state_updates[StateKeys.SCORE_IMPROVEMENT] = score_improvement
+
+        # Track test results if available
+        test_results = tool_context.state.get(StateKeys.TEST_EXECUTION_SUMMARY, {})
+
+        # Parse if it's a string
+        if isinstance(test_results, str):
+            try:
+                test_results = json.loads(test_results)
+            except:
+                test_results = {}
+
+        if test_results and test_results.get('test_summary', {}).get('total_tests_run', 0) > 0:
+            summary = test_results['test_summary']
+            total = summary.get('total_tests_run', 0)
+            passed = summary.get('tests_passed', 0)
+            if total > 0:
+                pass_rate = (passed / total) * 100
+                state_updates[StateKeys.USER_LAST_TEST_PASS_RATE] = pass_rate
+
+        # Apply all updates atomically
+        for key, value in state_updates.items():
+            tool_context.state[key] = value
+
+        logger.info(f"Tool: Progress updated - Attempt #{attempts}, "
+                    f"Lifetime: {lifetime_submissions}")
+
+        return {
+            "status": "success",
+            "session_attempts": attempts,
+            "lifetime_submissions": lifetime_submissions,
+            "timestamp": current_time,
+            "improvement": {
+                "style_score_change": score_improvement,
+                "direction": "improved" if score_improvement > 0 else "declined"
+            },
+            "summary": f"Attempt #{attempts} recorded, {lifetime_submissions} total submissions"
+        }
+
+    except Exception as e:
+        error_msg = f"Progress update error: {str(e)}"
+        logger.error(f"Tool: {error_msg}", exc_info=True)
+
+        return {
+            "status": "error",
+            "message": error_msg
+        }
 
 
-# MODULE_5_STEP_4_SAVE_GRADING_REPORT
+async def save_grading_report(feedback_text: str, tool_context: ToolContext) -> Dict[str, Any]:
+    """
+    Saves a detailed grading report as an artifact.
+
+    Args:
+        feedback_text: The feedback text to include in the report
+        tool_context: ADK tool context for state management
+
+    Returns:
+        Dictionary containing save status and details
+    """
+    logger.info("Tool: Saving grading report...")
+
+    try:
+        # Gather all relevant data from state
+        code = tool_context.state.get(StateKeys.CODE_TO_REVIEW, '')
+        analysis = tool_context.state.get(StateKeys.CODE_ANALYSIS, {})
+        style_score = tool_context.state.get(StateKeys.STYLE_SCORE, 0)
+        style_issues = tool_context.state.get(StateKeys.STYLE_ISSUES, [])
+
+        # Get test results
+        test_results = tool_context.state.get(StateKeys.TEST_EXECUTION_SUMMARY, {})
+
+        # Parse if it's a string
+        if isinstance(test_results, str):
+            try:
+                test_results = json.loads(test_results)
+            except:
+                test_results = {}
+
+        timestamp = datetime.now().isoformat()
+
+        # Create comprehensive report dictionary
+        report = {
+            'timestamp': timestamp,
+            'grading_attempt': tool_context.state.get(StateKeys.GRADING_ATTEMPTS, 1),
+            'code': {
+                'content': code,
+                'line_count': len(code.splitlines()),
+                'hash': hashlib.md5(code.encode()).hexdigest()
+            },
+            'analysis': analysis,
+            'style': {
+                'score': style_score,
+                'issues': style_issues[:5]  # First 5 issues
+            },
+            'tests': test_results,
+            'feedback': feedback_text,
+            'improvements': {
+                'score_change': tool_context.state.get(StateKeys.SCORE_IMPROVEMENT, 0),
+                'from_last_score': tool_context.state.get(StateKeys.USER_LAST_STYLE_SCORE, 0)
+            }
+        }
+
+        # Convert report to JSON string
+        report_json = json.dumps(report, indent=2)
+        report_part = types.Part.from_text(text=report_json)
+
+        # Try to save as artifact if the service is available
+        if hasattr(tool_context, 'save_artifact'):
+            try:
+                # Generate filename with timestamp (replace colons for filesystem compatibility)
+                filename = f"grading_report_{timestamp.replace(':', '-')}.json"
+
+                # Save the main report
+                version = await tool_context.save_artifact(filename, report_part)
+
+                # Also save a "latest" version for easy access
+                await tool_context.save_artifact("latest_grading_report.json", report_part)
+
+                logger.info(f"Tool: Report saved as {filename} (version {version})")
+
+                # Store report in state as well for redundancy
+                tool_context.state[StateKeys.USER_LAST_GRADING_REPORT] = report
+
+                return {
+                    "status": "success",
+                    "artifact_saved": True,
+                    "filename": filename,
+                    "version": str(version),
+                    "size": len(report_json),
+                    "summary": f"Report saved as {filename}"
+                }
+
+            except Exception as artifact_error:
+                logger.warning(f"Artifact service error: {artifact_error}, falling back to state storage")
+                # Continue to fallback below
+
+        # Fallback: Store in state if artifact service is not available or failed
+        tool_context.state[StateKeys.USER_LAST_GRADING_REPORT] = report
+        logger.info("Tool: Report saved to state (artifact service not available)")
+
+        return {
+            "status": "success",
+            "artifact_saved": False,
+            "message": "Report saved to state only",
+            "size": len(report_json),
+            "summary": "Report saved to session state"
+        }
+
+    except Exception as e:
+        error_msg = f"Report save error: {str(e)}"
+        logger.error(f"Tool: {error_msg}", exc_info=True)
+
+        # Still try to save minimal data to state
+        try:
+            tool_context.state[StateKeys.USER_LAST_GRADING_REPORT] = {
+                'error': error_msg,
+                'feedback': feedback_text,
+                'timestamp': datetime.now().isoformat()
+            }
+        except:
+            pass
+
+        return {
+            "status": "error",
+            "message": error_msg,
+            "artifact_saved": False,
+            "summary": f"Failed to save report: {error_msg}"
+        }
 
 
 # MODULE_6_STEP_3_VALIDATE_FIXED_STYLE
