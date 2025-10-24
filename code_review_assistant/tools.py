@@ -188,10 +188,183 @@ def _calculate_avg_function_length(tree: ast.AST) -> float:
     return 0.0
 
 
-# MODULE_5_STEP_1_STYLE_CHECKER_TOOL
+async def check_code_style(code: str, tool_context: ToolContext) -> Dict[str, Any]:
+    """
+    Checks code style compliance using pycodestyle (PEP 8).
+
+    Args:
+        code: Python source code to check (or will retrieve from state)
+        tool_context: ADK tool context
+
+    Returns:
+        Dictionary containing style score and issues
+    """
+    logger.info("Tool: Checking code style...")
+
+    try:
+        # Retrieve code from state if not provided
+        if not code:
+            code = tool_context.state.get(StateKeys.CODE_TO_REVIEW, '')
+            if not code:
+                return {
+                    "status": "error",
+                    "message": "No code provided or found in state"
+                }
+
+        # Run style check in thread pool
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            result = await loop.run_in_executor(
+                executor, _perform_style_check, code
+            )
+
+        # Store results in state
+        tool_context.state[StateKeys.STYLE_SCORE] = result['score']
+        tool_context.state[StateKeys.STYLE_ISSUES] = result['issues']
+        tool_context.state[StateKeys.STYLE_ISSUE_COUNT] = result['issue_count']
+
+        logger.info(f"Tool: Style check complete - Score: {result['score']}/100, "
+                    f"Issues: {result['issue_count']}")
+
+        return result
+
+    except Exception as e:
+        error_msg = f"Style check failed: {str(e)}"
+        logger.error(f"Tool: {error_msg}", exc_info=True)
+
+        # Set default values on error
+        tool_context.state[StateKeys.STYLE_SCORE] = 0
+        tool_context.state[StateKeys.STYLE_ISSUES] = []
+
+        return {
+            "status": "error",
+            "message": error_msg,
+            "score": 0
+        }
 
 
-# MODULE_5_STEP_1_STYLE_HELPERS
+def _perform_style_check(code: str) -> Dict[str, Any]:
+    """Helper to perform style check in thread pool."""
+    import io
+    import sys
+
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.py', delete=False) as tmp:
+        tmp.write(code)
+        tmp_path = tmp.name
+
+    try:
+        # Capture stdout to get pycodestyle output
+        old_stdout = sys.stdout
+        sys.stdout = captured_output = io.StringIO()
+
+        style_guide = pycodestyle.StyleGuide(
+            quiet=False,  # We want output
+            max_line_length=100,
+            ignore=['E501', 'W503']
+        )
+
+        result = style_guide.check_files([tmp_path])
+
+        # Restore stdout
+        sys.stdout = old_stdout
+
+        # Parse captured output
+        output = captured_output.getvalue()
+        issues = []
+
+        for line in output.strip().split('\n'):
+            if line and ':' in line:
+                parts = line.split(':', 4)
+                if len(parts) >= 4:
+                    try:
+                        issues.append({
+                            'line': int(parts[1]),
+                            'column': int(parts[2]),
+                            'code': parts[3].split()[0] if len(parts) > 3 else 'E000',
+                            'message': parts[3].strip() if len(parts) > 3 else 'Unknown error'
+                        })
+                    except (ValueError, IndexError):
+                        pass
+
+        # Add naming convention checks
+        try:
+            tree = ast.parse(code)
+            naming_issues = _check_naming_conventions(tree)
+            issues.extend(naming_issues)
+        except SyntaxError:
+            pass  # Syntax errors will be caught elsewhere
+
+        # Calculate weighted score
+        score = _calculate_style_score(issues)
+
+        return {
+            "status": "success",
+            "score": score,
+            "issue_count": len(issues),
+            "issues": issues[:10],  # First 10 issues
+            "summary": f"Style score: {score}/100 with {len(issues)} violations"
+        }
+
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+def _check_naming_conventions(tree: ast.AST) -> List[Dict[str, Any]]:
+    """Check PEP 8 naming conventions."""
+    naming_issues = []
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef):
+            # Skip private/protected methods and __main__
+            if not node.name.startswith('_') and node.name != node.name.lower():
+                naming_issues.append({
+                    'line': node.lineno,
+                    'column': node.col_offset,
+                    'code': 'N802',
+                    'message': f"N802 function name '{node.name}' should be lowercase"
+                })
+        elif isinstance(node, ast.ClassDef):
+            # Check if class name follows CapWords convention
+            if not node.name[0].isupper() or '_' in node.name:
+                naming_issues.append({
+                    'line': node.lineno,
+                    'column': node.col_offset,
+                    'code': 'N801',
+                    'message': f"N801 class name '{node.name}' should use CapWords convention"
+                })
+
+    return naming_issues
+
+
+def _calculate_style_score(issues: List[Dict[str, Any]]) -> int:
+    """Calculate weighted style score based on violation severity."""
+    if not issues:
+        return 100
+
+    # Define weights by error type
+    weights = {
+        'E1': 10,  # Indentation errors
+        'E2': 3,  # Whitespace errors
+        'E3': 5,  # Blank line errors
+        'E4': 8,  # Import errors
+        'E5': 5,  # Line length
+        'E7': 7,  # Statement errors
+        'E9': 10,  # Syntax errors
+        'W2': 2,  # Whitespace warnings
+        'W3': 2,  # Blank line warnings
+        'W5': 3,  # Line break warnings
+        'N8': 7,  # Naming conventions
+    }
+
+    total_deduction = 0
+    for issue in issues:
+        code_prefix = issue['code'][:2] if len(issue['code']) >= 2 else 'E2'
+        weight = weights.get(code_prefix, 3)
+        total_deduction += weight
+
+    # Cap at 100 points deduction
+    return max(0, 100 - min(total_deduction, 100))
 
 
 # MODULE_5_STEP_4_SEARCH_PAST_FEEDBACK
