@@ -673,17 +673,282 @@ async def save_grading_report(feedback_text: str, tool_context: ToolContext) -> 
         }
 
 
-# MODULE_6_STEP_3_VALIDATE_FIXED_STYLE
+async def validate_fixed_style(tool_context: ToolContext) -> Dict[str, Any]:
+    """
+    Validates style compliance of the fixed code.
 
+    Args:
+        tool_context: ADK tool context containing fixed code in state
 
-# MODULE_6_STEP_3_COMPILE_FIX_REPORT
+    Returns:
+        Dictionary with style validation results
+    """
+    logger.info("Tool: Validating style of fixed code...")
 
+    try:
+        # Get the fixed code from state
+        code_fixes = tool_context.state.get(StateKeys.CODE_FIXES, '')
+       
+        # Try to extract from markdown if present
+        if '```python' in code_fixes:
+            start = code_fixes.rfind('```python') + 9
+            end = code_fixes.rfind('```')
+            if start < end:
+                code_fixes = code_fixes[start:end].strip()
 
-# MODULE_6_STEP_3_EXIT_FIX_LOOP
+        if not code_fixes:
+            return {
+                "status": "error",
+                "message": "No fixed code found in state"
+            }
 
+        # Store the extracted fixed code
+        tool_context.state[StateKeys.CODE_FIXES] = code_fixes
 
-# MODULE_6_STEP_6_SAVE_FIX_REPORT
+        # Run style check on fixed code
+        loop = asyncio.get_event_loop()
+        with ThreadPoolExecutor() as executor:
+            style_result = await loop.run_in_executor(
+                executor, _perform_style_check, code_fixes
+            )
 
+        # Compare with original
+        original_score = tool_context.state.get(StateKeys.STYLE_SCORE, 0)
+        improvement = style_result['score'] - original_score
+
+        # Store results
+        tool_context.state[StateKeys.FIXED_STYLE_SCORE] = style_result['score']
+        tool_context.state[StateKeys.FIXED_STYLE_ISSUES] = style_result['issues']
+
+        logger.info(f"Tool: Fixed code style score: {style_result['score']}/100 "
+                    f"(improvement: +{improvement})")
+
+        return {
+            "status": "success",
+            "fixed_style_score": style_result['score'],
+            "original_style_score": original_score,
+            "improvement": improvement,
+            "remaining_issues": style_result['issues'],
+            "perfect_style": style_result['score'] == 100
+        }
+
+    except Exception as e:
+        logger.error(f"Tool: Style validation failed: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+async def compile_fix_report(tool_context: ToolContext) -> Dict[str, Any]:
+    """
+    Compiles comprehensive report of the fix process.
+
+    Args:
+        tool_context: ADK tool context with all fix pipeline data
+
+    Returns:
+        Comprehensive fix report
+    """
+    logger.info("Tool: Compiling comprehensive fix report...")
+
+    try:
+        # Gather all data
+        original_code = tool_context.state.get(StateKeys.CODE_TO_REVIEW, '')
+        code_fixes = tool_context.state.get(StateKeys.CODE_FIXES, '')
+
+        # Test results
+        original_tests = tool_context.state.get(StateKeys.TEST_EXECUTION_SUMMARY, {})
+        fixed_tests = tool_context.state.get(StateKeys.FIX_TEST_EXECUTION_SUMMARY, {})
+
+        # Parse if strings
+        if isinstance(original_tests, str):
+            try:
+                original_tests = json.loads(original_tests)
+            except:
+                original_tests = {}
+
+        if isinstance(fixed_tests, str):
+            try:
+                fixed_tests = json.loads(fixed_tests)
+            except:
+                fixed_tests = {}
+
+        # Extract pass rates
+        original_pass_rate = 0
+        if original_tests:
+            if 'pass_rate' in original_tests:
+                original_pass_rate = original_tests['pass_rate']
+            elif 'test_summary' in original_tests:
+                # Handle test_runner_agent's JSON structure
+                summary = original_tests['test_summary']
+                total = summary.get('total_tests_run', 0)
+                passed = summary.get('tests_passed', 0)
+                if total > 0:
+                    original_pass_rate = (passed / total) * 100
+            elif 'passed' in original_tests and 'total' in original_tests:
+                if original_tests['total'] > 0:
+                    original_pass_rate = (original_tests['passed'] / original_tests['total']) * 100
+
+        fixed_pass_rate = 0
+        all_tests_pass = False
+        if fixed_tests:
+            if 'pass_rate' in fixed_tests:
+                fixed_pass_rate = fixed_tests['pass_rate']
+                all_tests_pass = fixed_tests.get('failed', 1) == 0
+            elif 'passed' in fixed_tests and 'total' in fixed_tests:
+                if fixed_tests['total'] > 0:
+                    fixed_pass_rate = (fixed_tests['passed'] / fixed_tests['total']) * 100
+                all_tests_pass = fixed_tests.get('failed', 0) == 0
+
+        # Style scores
+        original_style = tool_context.state.get(StateKeys.STYLE_SCORE, 0)
+        fixed_style = tool_context.state.get(StateKeys.FIXED_STYLE_SCORE, 0)
+
+        # Calculate improvements
+        test_improvement = {
+            'original_pass_rate': original_pass_rate,
+            'fixed_pass_rate': fixed_pass_rate,
+            'improvement': fixed_pass_rate - original_pass_rate,
+            'all_tests_pass': all_tests_pass
+        }
+
+        style_improvement = {
+            'original_score': original_style,
+            'fixed_score': fixed_style,
+            'improvement': fixed_style - original_style,
+            'perfect_style': fixed_style == 100
+        }
+
+        # Determine overall status
+        if all_tests_pass and style_improvement['perfect_style']:
+            fix_status = 'SUCCESSFUL'
+            status_emoji = '✅'
+        elif test_improvement['improvement'] > 0 or style_improvement['improvement'] > 0:
+            fix_status = 'PARTIAL'
+            status_emoji = '⚠️'
+        else:
+            fix_status = 'FAILED'
+            status_emoji = '❌'
+
+        # Build comprehensive report
+        report = {
+            'status': fix_status,
+            'status_emoji': status_emoji,
+            'timestamp': datetime.now().isoformat(),
+            'original_code': original_code,
+            'code_fixes': code_fixes,
+            'improvements': {
+                'tests': test_improvement,
+                'style': style_improvement
+            },
+            'summary': f"{status_emoji} Fix Status: {fix_status}\n"
+                      f"Tests: {original_pass_rate:.1f}% → {fixed_pass_rate:.1f}%\n"
+                      f"Style: {original_style}/100 → {fixed_style}/100"
+        }
+
+        # Store report in state
+        tool_context.state[StateKeys.FIX_REPORT] = report
+        tool_context.state[StateKeys.FIX_STATUS] = fix_status
+
+        logger.info(f"Tool: Fix report compiled - Status: {fix_status}")
+        logger.info(f"Tool: Test improvement: {original_pass_rate:.1f}% → {fixed_pass_rate:.1f}%")
+        logger.info(f"Tool: Style improvement: {original_style} → {fixed_style}")
+
+        return {
+            "status": "success",
+            "fix_status": fix_status,
+            "report": report
+        }
+
+    except Exception as e:
+        logger.error(f"Tool: Failed to compile fix report: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": str(e)
+        }
+
+def exit_fix_loop(tool_context: ToolContext) -> Dict[str, Any]:
+    """
+    Signal that fixing is complete and should exit the loop.
+   
+    Args:
+        tool_context: ADK tool context
+       
+    Returns:
+        Confirmation message
+    """
+    logger.info("Tool: Setting escalate flag to exit fix loop")
+   
+    # This is the critical line that exits the LoopAgent
+    tool_context.actions.escalate = True
+   
+    return {
+        "status": "success",
+        "message": "Fix complete, exiting loop"
+    }
+
+async def save_fix_report(tool_context: ToolContext) -> Dict[str, Any]:
+    """
+    Saves the fix report as an artifact.
+
+    Args:
+        tool_context: ADK tool context
+
+    Returns:
+        Save status
+    """
+    logger.info("Tool: Saving fix report...")
+
+    try:
+        # Get the report from state
+        fix_report = tool_context.state.get(StateKeys.FIX_REPORT, {})
+
+        if not fix_report:
+            return {
+                "status": "error",
+                "message": "No fix report found in state"
+            }
+
+        # Convert to JSON
+        report_json = json.dumps(fix_report, indent=2)
+        report_part = types.Part.from_text(text=report_json)
+
+        # Generate filename
+        timestamp = datetime.now().isoformat().replace(':', '-')
+        filename = f"fix_report_{timestamp}.json"
+
+        # Try to save as artifact
+        if hasattr(tool_context, 'save_artifact'):
+            try:
+                version = await tool_context.save_artifact(filename, report_part)
+                await tool_context.save_artifact("latest_fix_report.json", report_part)
+
+                logger.info(f"Tool: Fix report saved as {filename}")
+
+                return {
+                    "status": "success",
+                    "filename": filename,
+                    "version": str(version),
+                    "size": len(report_json)
+                }
+            except Exception as e:
+                logger.warning(f"Could not save as artifact: {e}")
+
+        # Fallback: store in state
+        tool_context.state[StateKeys.LAST_FIX_REPORT] = fix_report
+
+        return {
+            "status": "success",
+            "message": "Fix report saved to state",
+            "size": len(report_json)
+        }
+
+    except Exception as e:
+        logger.error(f"Tool: Failed to save fix report: {e}", exc_info=True)
+        return {
+            "status": "error",
+            "message": str(e)
+        }
 
 # Module exports
 __all__ = [

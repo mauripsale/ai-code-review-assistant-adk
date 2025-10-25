@@ -5,14 +5,18 @@ This module defines a comprehensive code review assistant that analyzes
 Python code and provides detailed feedback through a multi-stage pipeline.
 """
 
-from google.adk.agents import Agent, SequentialAgent
+from google.adk.agents import Agent, SequentialAgent, LoopAgent
+from .config import config
+# Review pipeline imports (from Module 5)
 from code_review_assistant.sub_agents.review_pipeline.code_analyzer import code_analyzer_agent
 from code_review_assistant.sub_agents.review_pipeline.style_checker import style_checker_agent
 from code_review_assistant.sub_agents.review_pipeline.test_runner import test_runner_agent
 from code_review_assistant.sub_agents.review_pipeline.feedback_synthesizer import feedback_synthesizer_agent
-
-from google.adk.agents import Agent
-from .config import config
+# Fix pipeline imports (NEW)
+from code_review_assistant.sub_agents.fix_pipeline.code_fixer import code_fixer_agent
+from code_review_assistant.sub_agents.fix_pipeline.fix_test_runner import fix_test_runner_agent
+from code_review_assistant.sub_agents.fix_pipeline.fix_validator import fix_validator_agent
+from code_review_assistant.sub_agents.fix_pipeline.fix_synthesizer import fix_synthesizer_agent
 
 # Create sequential pipeline
 code_review_pipeline = SequentialAgent(
@@ -26,7 +30,28 @@ code_review_pipeline = SequentialAgent(
     ]
 )
 
-# Root agent - coordinates the review pipeline
+# Create the fix attempt loop (retries up to 3 times)
+fix_attempt_loop = LoopAgent(
+    name="FixAttemptLoop",
+    sub_agents=[
+        code_fixer_agent,      # Step 1: Generate fixes
+        fix_test_runner_agent, # Step 2: Validate with tests
+        fix_validator_agent    # Step 3: Check success & possibly exit
+    ],
+    max_iterations=3  # Try up to 3 times
+)
+
+# Wrap loop with synthesizer for final report
+code_fix_pipeline = SequentialAgent(
+    name="CodeFixPipeline",
+    description="Automated code fixing pipeline with iterative validation",
+    sub_agents=[
+        fix_attempt_loop,      # Try to fix (1-3 times)
+        fix_synthesizer_agent  # Present final results (always runs once)
+    ]
+)
+
+# Update root agent to include both pipelines
 root_agent = Agent(
     name="CodeReviewAssistant",
     model=config.worker_model,
@@ -38,16 +63,19 @@ When a user provides Python code for review:
 2. The pipeline will handle all analysis and feedback
 3. Return ONLY the final feedback from the pipeline - do not add any commentary
 
-When a user asks what you can do or asks general questions:
-- Explain your capabilities for code review
+After completing a review, if significant issues were identified:
+- If style score < 100 OR tests are failing OR critical issues exist:
+  * Add at the end: "\n\n💡 I can fix these issues for you. Would you like me to do that?"
+ 
+- If the user responds yes or requests fixes:
+  * Delegate to CodeFixPipeline
+  * Return the fix pipeline's complete output AS-IS
+
+When a user asks what you can do or general questions:
+- Explain your capabilities for code review and fixing
 - Do NOT trigger the pipeline for non-code messages
 
-The pipeline handles everything for code review - just pass through its final output.""",
-    sub_agents=[code_review_pipeline],
+The pipelines handle everything for code review and fixing - just pass through their final output.""",
+    sub_agents=[code_review_pipeline, code_fix_pipeline],
     output_key="assistant_response"
 )
-
-# MODULE_6_STEP_5_CREATE_FIX_LOOP
-
-
-# MODULE_6_STEP_5_UPDATE_ROOT_AGENT
